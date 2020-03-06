@@ -1,0 +1,11 @@
+Base path: 'D:/unity hub download/2019.3.3f1/Editor/Data', plugins path 'D:/unity hub download/2019.3.3f1/Editor/Data/PlaybackEngines'
+Cmd: initializeCompiler
+Cmd: compileComputeKernel
+  error: 1 plat 4 at worldShader.compute(362): use of potentially uninitialized variable (newl)
+  error: 1 plat 4 at worldShader.compute(423): signed/unsigned mismatch, unsigned assumed
+  error: 1 plat 4 at worldShader.compute(427): signed/unsigned mismatch, unsigned assumed
+  error: 1 plat 4 at worldShader.compute(485): implicit truncation of vector type
+  error: 1 plat 4 at worldShader.compute(490): implicit truncation of vector type
+  error: 1 plat 4 at worldShader.compute(500): floating point division by zero
+  error: 1 plat 4 at worldShader.compute(549): signed/unsigned mismatch, unsigned assumed
+  api=4 insize=15564 outsize=130025 ok=1

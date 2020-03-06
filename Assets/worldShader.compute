@@ -1,0 +1,645 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#define MAX_STEPS 1000
+//#define MAX_DIST 400
+#define SURF_DIST 1e-3
+Texture2D<float4> Source;
+RWTexture2D<float4> Destination;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+static const float PI = 3.14159265f;
+int Reflections;
+float MAX_DIST;
+int AA;
+float4 _Time;
+
+struct Shape {
+	float3 pos;
+	float3 rad;
+	float3 rot;
+	int shape;
+	int op;
+	float4 albedo;
+	int comboId;
+	int shell;
+	float roundness;
+	int numChildren;
+	int hasParent;
+	float blendyness;
+	float3 scale;
+	float3 stretch;
+	int parentLevel;
+	int seeThrough;
+	float refrac;
+	int repeat;
+	int xRep;
+	int yRep;
+	int zRep;
+	float repLength;
+};
+StructuredBuffer<Shape> _Shapes;
+
+struct Light {
+	float3 pos;
+	float3 forward;
+	float3 color;
+	float intense;
+	float directional;
+	float maxDist;
+	float hardShad;
+};
+StructuredBuffer<Light> _Lights;
+
+float sdPlane(float3 p, float4 n)
+{
+	// n must be normalized
+	return dot(p, n.xyz) + n.w;
+}
+
+float sdSphere(float3 p, float s)
+{
+	return length(p) - s;
+}
+
+float sdBox(float3 p, float3 b)
+{
+	float3 d = abs(p) - b;
+	return min(max(d.x, max(d.y, d.z)), 0.0) + length(max(d, 0.0));
+}
+
+float sdTorus(float3 p, float2 t)
+{
+	return length(float2(length(p.xz) - t.x, p.y)) - t.y;
+}
+
+float sdCappedTorus(in float3 p, in float2 sc, in float ra, in float rb)
+{
+	p.x = abs(p.x);
+	float k = (sc.y * p.x > sc.x* p.y) ? dot(p.xy, sc) : length(p.xy);
+	return sqrt(dot(p, p) + ra * ra - 2.0 * ra * k) - rb;
+}
+
+float sdHexPrism(float3 p, float2 h)
+{
+	float3 q = abs(p);
+
+	const float3 k = float3(-0.8660254, 0.5, 0.57735);
+	p = abs(p);
+	p.xy -= 2.0 * min(dot(k.xy, p.xy), 0.0) * k.xy;
+	float2 d = float2(
+		length(p.xy - float2(clamp(p.x, -k.z * h.x, k.z * h.x), h.x)) * sign(p.y - h.x),
+		p.z - h.y);
+	return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+float sdRoundCone(in float3 p, in float r1, float r2, float h)
+{
+	float2 q = float2(length(p.xz), p.y);
+
+	float b = (r1 - r2) / h;
+	float a = sqrt(1.0 - b * b);
+	float k = dot(q, float2(-b, a));
+
+	if (k < 0.0) return length(q) - r1;
+	if (k > a* h) return length(q - float2(0.0, h)) - r2;
+
+	return dot(q, float2(a, b)) - r1;
+}
+
+float dot2(in float3 v) { return dot(v, v); }
+float sdRoundCone(float3 p, float3 a, float3 b, float r1, float r2)
+{
+	// sampling independent computations (only depend on shape)
+	float3  ba = b - a;
+	float l2 = dot(ba, ba);
+	float rr = r1 - r2;
+	float a2 = l2 - rr * rr;
+	float il2 = 1.0 / l2;
+
+	// sampling dependant computations
+	float3 pa = p - a;
+	float y = dot(pa, ba);
+	float z = y - l2;
+	float x2 = dot2(pa * l2 - ba * y);
+	float y2 = y * y * l2;
+	float z2 = z * z * l2;
+
+	// single square root!
+	float k = sign(rr) * rr * rr * x2;
+	if (sign(z) * a2 * z2 > k) return  sqrt(x2 + z2) * il2 - r2;
+	if (sign(y) * a2 * y2 < k) return  sqrt(x2 + y2) * il2 - r1;
+	return (sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+}
+
+
+
+float sdTriPrism(float3 p, float2 h)
+{
+	const float k = sqrt(3.0);
+	h.x *= 0.5 * k;
+	p.xy /= h.x;
+	p.x = abs(p.x) - 1.0;
+	p.y = p.y + 1.0 / k;
+	if (p.x + k * p.y > 0.0) p.xy = float2(p.x - k * p.y, -k * p.x - p.y) / 2.0;
+	p.x -= clamp(p.x, -2.0, 0.0);
+	float d1 = length(p.xy) * sign(-p.y) * h.x;
+	float d2 = abs(p.z) - h.y;
+	return length(max(float2(d1, d2), 0.0)) + min(max(d1, d2), 0.);
+}
+
+
+float sdCappedCylinder(float3 p, float h, float r)
+{
+	float2 d = abs(float2(length(p.xz), p.y)) - float2(h, r);
+	return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+// vertical
+float sdCone(in float3 p, in float3 c)
+{
+	float2 q = float2(length(p.xz), p.y);
+	float d1 = -q.y - c.z;
+	float d2 = max(dot(q, c.xy), q.y);
+	return length(max(float2(d1, d2), 0.0)) + min(max(d1, d2), 0.);
+}
+
+float dot2(in float2 v) { return dot(v, v); }
+float sdCone(in float3 p, in float h, in float r1, in float r2)
+{
+	float2 q = float2(length(p.xz), p.y);
+
+	float2 k1 = float2(r2, h);
+	float2 k2 = float2(r2 - r1, 2.0 * h);
+	float2 ca = float2(q.x - min(q.x, (q.y < 0.0) ? r1 : r2), abs(q.y) - h);
+	float2 cb = q - k1 + k2 * clamp(dot(k1 - q, k2) / dot2(k2), 0.0, 1.0);
+	float s = (cb.x < 0.0 && ca.y < 0.0) ? -1.0 : 1.0;
+	return s * sqrt(min(dot2(ca), dot2(cb)));
+}
+
+float sdOctahedron(float3 p, float s)
+{
+	p = abs(p);
+	float m = p.x + p.y + p.z - s;
+
+	// exact distance
+#if 0
+	float3 o = min(3.0 * p - m, 0.0);
+	o = max(6.0 * p - m * 2.0 - o * 3.0 + (o.x + o.y + o.z), 0.0);
+	return length(p - s * o / (o.x + o.y + o.z));
+#endif
+
+	// exact distance
+#if 1
+	float3 q;
+	if (3.0 * p.x < m) q = p.xyz;
+	else if (3.0 * p.y < m) q = p.yzx;
+	else if (3.0 * p.z < m) q = p.zxy;
+	else return m * 0.57735027;
+	float k = clamp(0.5 * (q.z - q.y + s), 0.0, s);
+	return length(float3(q.x, q.y - s + k, q.z - k));
+#endif
+
+	// bound, not exact
+#if 0
+	return m * 0.57735027;
+#endif
+}
+
+float sdPyramid(in float3 p, in float h, in float w)
+{
+	float m2 = h * h + 0.25;
+
+	// symmetry
+	p.xz = abs(p.xz);
+	p.xz = (p.z > p.x) ? p.zx : p.xz;
+	p.xz -= 0.5;
+
+	// project into face plane (2D)
+	float3 q = float3(p.z, h * p.y - 0.5 * p.x, h * p.x + 0.5 * p.y);
+
+	float s = max(-q.x, 0.0);
+	float t = clamp((q.y - 0.5 * p.z) / (m2 + 0.25), 0.0, 1.);
+
+	float a = m2 * (q.x + s) * (q.x + s) + q.y * q.y;
+	float b = m2 * (q.x + 0.5 * t) * (q.x + 0.5 * t) + (q.y - m2 * t) * (q.y - m2 * t);
+
+	float d2 = min(q.y, -q.x * m2 - q.y * 0.5) > 0.0 ? 0.0 : min(a, b);
+
+	// recover 3D and scale, and add sign
+	return sqrt((d2 + q.z * q.z) / m2) * sign(max(q.z, -p.y));;
+}
+
+float ndot(float2 a, float2 b) { return a.x * b.x - a.y * b.y; }
+
+struct Ray
+{
+	float3 origin;
+	float3 direction;
+	float3 energy;
+};
+Ray CreateRay(float3 origin, float3 direction)
+{
+	Ray ray;
+	ray.origin = origin;
+	ray.direction = direction;
+	ray.energy = float3(1, 1, 1);
+	return ray;
+}
+Ray CreateCameraRay(float2 uv)
+{
+	// Transform the camera origin to world space
+	float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+	// Invert the perspective projection of the view-space position
+	float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+	// Transform the direction from camera to world space and normalize
+	direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+	direction = normalize(direction);
+	return CreateRay(origin, direction);
+}
+struct RayHit
+{
+	float3 pos;
+	float distance;
+	float3 normal;
+	float closestMiss;
+	float3 albedo;
+	float3 specular;
+	Shape shap;
+};
+RayHit CreateRayHit()
+{
+	RayHit hit;
+	hit.pos = float3(0.0f, 0.0f, 0.0f);
+	hit.distance = 1.#INF;
+	hit.normal = float3(0.0f, 0.0f, 0.0f);
+	return hit;
+}
+float sdHexPrism(float3 p, float3 a, float2 h)
+{
+	p = p - a;
+	const float3 k = float3(-0.8660254, 0.5, 0.57735);
+	p = abs(p);
+	p.xy -= 2.0 * min(dot(k.xy, p.xy), 0.0) * k.xy;
+	float2 d = float2(
+		length(p.xy - float2(clamp(p.x, -k.z * h.x, k.z * h.x), h.x)) * sign(p.y - h.x),
+		p.z - h.y);
+
+	return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+float smin(float a, float b, float k)
+{
+	k = 5;
+	float h = max(k - abs(a - b), 0.0) / k;
+	return min(a, b) - h * h * h * k * (1.0 / 6.0);
+}
+struct retCol {
+	float4 blendCol;
+	float dist;
+	Shape sh;
+};
+retCol Blend(float a, float b, float4 colA, float4 colB, float k)
+{
+	float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+	float blendDst = lerp(b, a, h) - k * h * (1.0 - h);
+	float4 blendCol = lerp(colB, colA, h);
+	retCol r;
+	r.blendCol = blendCol;
+	r.dist = blendDst;
+	return r;
+}
+float2x2 Rot(float a) {
+	float s = sin(a);
+	float c = cos(a);
+	return float2x2(c, -s, s, c);
+}
+float3 GetNormal(float3 p);
+float getDistForShape(float3 p, Shape s) {
+	float newl;
+	float3 bp = p - s.pos;
+	float c = s.repLength;
+	bp.y += sin(length(float2(p.x,p.z))/100.+_Time.z)*100;
+	if (s.repeat) {
+		if (s.xRep > -1) {
+			bp.x = bp.x - c * clamp(round(bp.x / c), -s.xRep, s.xRep);
+		}
+		else {
+			bp.x = abs(bp.x) % c - (c / 2);
+		}
+		if (s.yRep > -1) {
+			bp.y = bp.y - c * clamp(round(bp.y / c), -s.yRep, s.yRep);
+		}
+		else {
+			bp.y = abs(bp.y) % c - (c / 2);
+		}
+		if (s.zRep > -1) {
+			bp.z = bp.z - c * clamp(round(bp.z / c), -s.zRep, s.zRep);
+		}
+		else {
+			bp.z = abs(bp.z) % c - (c / 2);
+		}
+		
+	}
+	if (s.scale.x + s.scale.y + s.scale.z != 0) {
+		bp *= s.scale;
+	}
+	if (s.stretch.x + s.stretch.y + s.stretch.z != 0) {
+		bp.x = bp.x - clamp(bp.x, -s.stretch.x, s.stretch.x);
+		bp.y = bp.y - clamp(bp.y, -s.stretch.y, s.stretch.y);
+		bp.z = bp.z - clamp(bp.z, -s.stretch.z, s.stretch.z);
+	}
+	if (s.rot.x + s.rot.y + s.rot.z != 0) {
+		bp.xz = mul(Rot(s.rot.y / 180 * PI), bp.xz);
+		bp.xy = mul(Rot(-s.rot.z / 180 * PI), bp.xy);
+		bp.yz = mul(Rot(-s.rot.x / 180 * PI), bp.yz);
+	}
+	
+	
+	switch (s.shape) {
+	case 0:
+		newl = sdBox(bp, s.rad);
+		break;
+	case 1:
+		newl = length(bp) - s.rad.x;
+		break;
+	case 2:
+		newl = sdTorus(bp, float2(s.rad.x, s.rad.y));
+		break;
+	case 3:
+		newl = sdHexPrism(bp, s.rad.xy);
+		break;
+	case 4:
+		newl = sdRoundCone(bp, s.rad.x, s.rad.y, s.rad.z);
+		break;
+	case 5:
+		newl = sdTriPrism(bp, s.rad.xy);
+		break;
+	case 6:
+		newl = sdCappedCylinder(bp, s.rad.x, s.rad.y);
+		break;
+	case 7:
+		newl = sdCone(bp, s.rad.x, s.rad.y, s.rad.z);
+		break;
+	case 8:
+		newl = sdOctahedron(bp, s.rad.x);
+		break;
+	case 9:
+		newl = sdPyramid(bp, s.rad.x, s.rad.y);
+		break;
+	case 10:
+		newl = sdPlane(bp, normalize(float4(0, 1, 0, 1)));
+		break;
+	default:
+		//newl = length(p - s.pos) - s.rad;
+		break;
+	}
+	if (s.shell > 0) {
+		newl = abs(newl);
+	}
+	if (s.roundness != 0) {
+		newl -= s.roundness;
+	}
+	float div = 1;
+	if (s.scale.x + s.scale.y + s.scale.z != 0) {
+		div = max(1, s.scale.y);
+		div = max(div, s.scale.x);
+		div = max(div, s.scale.z);
+	}
+	return newl/div;
+}
+
+retCol getOp(float v1, float v2, Shape s, Shape s2,float4 col1, float4 col2) {
+	float returner = v2;
+	float4 returnColor = col2;
+	Shape retS = s2;
+	retCol r;
+	switch (s.op) {
+		case 0 :
+			if (v1 < returner) {
+				returner = v1;
+				returnColor = col1;
+				retS = s;
+			}
+			break;
+		case 1:
+			returner = max(-v1, returner);
+			break;
+		
+		case 2:
+			retCol result = Blend(v1, v2, col1, col2, s.blendyness);
+			if (result.dist < returner) {
+				returner = result.dist;
+				returnColor = result.blendCol;
+				retS = s;
+			}
+			break;
+		case 3:
+			returner = max(v1, returner);
+			break;
+		case 4:
+			if (v1 < returner) {
+				returnColor = col1;
+			}
+			break;
+	}
+	r.dist = returner;
+	r.blendCol = returnColor;
+	r.sh = retS;
+	return r;
+}
+
+RayHit newGetDist(float3 p) {
+	RayHit r;
+	
+	uint numShapes, stride;
+	_Shapes.GetDimensions(numShapes, stride);
+	float finalDist = MAX_DIST;
+	float4 finalColor = float4(1, 1, 1, 1);
+	Shape finalShape = _Shapes[0];
+	int lastId;
+	for (int i = 0; i < numShapes; i++) {
+		if (_Shapes[i].hasParent == 0) {
+			Shape s = _Shapes[i];
+			float d1 = getDistForShape(p, s);
+			for (int j = 0; j < numShapes; j++) {
+				if (s.comboId == _Shapes[j].comboId && i != j && s.parentLevel == _Shapes[j].parentLevel-1) {
+					Shape s2 = _Shapes[j];
+					float d2 = getDistForShape(p, s2);
+					retCol res1 = getOp(d2, d1, s2,finalShape, s2.albedo, s.albedo);
+					d1 = res1.dist;
+					//finalColor = res1.blendCol;
+				}
+			}
+			retCol result = getOp(d1, finalDist, s, finalShape,s.albedo, finalColor);
+			finalDist = result.dist;
+			finalColor = result.blendCol;
+			lastId = s.comboId;
+			finalShape = result.sh;
+		}
+	}
+	r.shap = finalShape;
+	r.distance = finalDist;
+	r.albedo = finalColor.xyz;
+	r.specular = finalColor.xyz * finalColor.w;
+	return r;
+}
+
+RayHit RayMarch(float3 ro, float3 rd) {
+	RayHit r;
+	float dO = 0;
+	float dS = -1.#INF;
+	float miny = 1.#INF;
+	for (int i = 0; i < MAX_STEPS; i++) {
+		float3 p = ro + dO * rd;
+		r = newGetDist(p);
+		dS = r.distance;
+		if (r.distance < dS) {
+			if (r.distance < miny) {
+				miny = r.distance;
+			}
+		}
+			dO += dS;
+		if (abs(dS) < SURF_DIST || dO > MAX_DIST) break;
+	}
+	r.distance = dO;
+	r.closestMiss = miny;
+	return r;
+}
+
+float3 GetNormal(float3 p) {
+	float d = newGetDist(p).distance;
+	float2 e = float2(1e-2, 0);
+
+	float3 n = d - float3(
+		newGetDist(p - e.xyy).distance,
+		newGetDist(p - e.yxy).distance,
+		newGetDist(p - e.yyx).distance
+		);
+	return normalize(n);
+}
+
+float shadow(in float3 ro, in float3 rd, float mint, float maxt, float w)
+{
+	float s = 1.0;
+	for (float t = mint; t < maxt; )
+	{
+		float h = newGetDist(ro + rd * t).distance;
+		s = min(s, 0.5 + 0.5 * h / (w * t));
+		if (h < .001) break;
+		t += h;
+	}
+	s = max(s, 0.0);
+	return s * s * (3.0 - 2.0 * s); // smoothstep
+}
+
+float softshadow(in float3 ro, in float3 rd, float mint, float maxt, float k)
+{
+	float res = 1.0;
+	float ph = 1e20;
+	for (float t = mint; t < maxt; )
+	{
+		float h = newGetDist(ro + rd * t).distance;
+		if (h < 0.001)
+			return 0.0;
+		float y = h * h / (2.0 * ph);
+		float d = sqrt(h * h - y * y);
+			res = min(res, k * d / max(0.0, t - y));
+		ph = h;
+		t += h;
+	}
+	return res;
+}
+
+float3 Shade(inout Ray ray, RayHit hit)
+{
+	if (hit.distance < MAX_DIST)
+	{
+		float3 specular = hit.specular;
+		float3 albedo = hit.albedo;
+		if (hit.shap.seeThrough == 1) {
+			ray.origin = hit.pos - hit.normal * .1;
+			ray.direction = refract(ray.direction, hit.normal, hit.shap.refrac);
+			ray.energy *= specular;
+		}
+		else {
+
+			ray.origin = hit.pos + hit.normal * 0.01f;
+			ray.direction = reflect(ray.direction, hit.normal);
+			ray.energy *= specular;
+		}
+		uint numLights, stride;
+		_Lights.GetDimensions(numLights, stride);
+		float3 sumColor = float3(0,0,0);
+		float3 baseColor;
+		float minShadow = 1.#INF;
+		float shadowy = 1;
+		for (int i = 0; i < numLights; i++) {
+			if (_Lights[i].directional > 0) {
+				baseColor = saturate(dot(hit.normal, _Lights[i].forward*-1)) * albedo;
+				minShadow = RayMarch(hit.pos + hit.normal * 0.01f, normalize(_Lights[i].forward * -1)).distance;
+			}
+			else {
+				baseColor = saturate(dot(hit.normal, normalize((_Lights[i].pos - hit.pos)))) * albedo;
+				minShadow = RayMarch(hit.pos + hit.normal * 0.01f, normalize(_Lights[i].pos - hit.pos)).distance;
+			}
+			if (_Lights[i].hardShad == 1) {
+				shadowy = (minShadow < MAX_DIST && minShadow < length(_Lights[i].pos - hit.pos)) ? 0 : 1;
+			}
+			else if (_Lights[i].hardShad == 2) {
+				shadowy = shadow(hit.pos + hit.normal * 0.01f, normalize(_Lights[i].forward * -1), 0, MAX_DIST, .5);
+			}
+			
+			
+			
+			baseColor *= _Lights[i].color * _Lights[i].intense * shadowy;
+			if (length(_Lights[i].pos - hit.pos) <= _Lights[i].maxDist && _Lights[i].directional == 0) {
+				sumColor += baseColor * ((_Lights[i].maxDist - length(_Lights[i].pos - hit.pos))/ _Lights[i].maxDist);
+			}else if(_Lights[i].directional == 1){
+				sumColor += baseColor;
+			}
+		}
+		 //sumColor = RayMarch(ray.origin, ray.direction).albedo/10;
+		return  sumColor;
+	}
+	else
+	{
+		// Erase the ray's energy - the sky doesn't reflect anything
+		ray.energy = 0.0f;
+		// Sample the skybox and write it
+		float theta = acos(ray.direction.y) / -PI;
+		float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+		return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+	}
+}
+
+[numthreads(8,8,1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+	uint width, height;
+	Destination.GetDimensions(width, height);
+	//Destination[id.xy] = Source[id.xy];
+	float3 final = float3(0, 0, 0);
+	for (int i = 0; i < AA; i++) {
+		for (int j = 0; j < AA; j++) {
+		float2 uv = id.xy / float2(width, height) * 2 - 1;
+		float3 result = float3(0, 0, 0);
+		Ray ray = CreateCameraRay(uv+float2(.001*(i-1),.001*(j-1)));
+			for (int x = 0; x < Reflections; x++)
+			{
+				RayHit d = RayMarch(ray.origin, ray.direction);
+				d.pos = ray.origin + ray.direction * d.distance;
+				d.normal = GetNormal(d.pos);
+				//result = d.pos;
+				result += ray.energy * Shade(ray, d);
+				if (!any(ray.energy))
+					break;
+			}
+			final += result;
+		}
+	}
+	
+	Destination[id.xy] = float4(final/(AA*AA), 1);
+}

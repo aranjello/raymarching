@@ -1,0 +1,9 @@
+Base path: 'D:/unity hub download/2019.3.3f1/Editor/Data', plugins path 'D:/unity hub download/2019.3.3f1/Editor/Data/PlaybackEngines'
+Cmd: initializeCompiler
+Cmd: compileComputeKernel
+  error: 1 plat 4 at worldShader.compute(396): use of potentially uninitialized variable (newl)
+  error: 1 plat 4 at worldShader.compute(462): signed/unsigned mismatch, unsigned assumed
+  error: 1 plat 4 at worldShader.compute(466): signed/unsigned mismatch, unsigned assumed
+  error: 1 plat 4 at worldShader.compute(529): floating point division by zero
+  error: 1 plat 4 at worldShader.compute(578): signed/unsigned mismatch, unsigned assumed
+  api=4 insize=16282 outsize=153694 ok=1
